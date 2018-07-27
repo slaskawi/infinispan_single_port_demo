@@ -16,3 +16,8 @@ test-single-port:
 build-image:	
 	cd image && ./build.sh
 .PHONY: build-image
+
+generate-keystores:
+	cd keystore && ./generate_keystores.sh
+	cp keystore/* client/src/test/resources
+.PHONY: generate-keystores

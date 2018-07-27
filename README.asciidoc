@@ -1,0 +1,1 @@
+curl --http1.1 --cacert keystore/server-cert.pem -v https://infinispan-app-https-myproject.127.0.0.1.nip.io/rest/default/test

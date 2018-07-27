@@ -42,6 +42,13 @@
                     <properties path="application-roles.properties" relative-to="jboss.server.config.dir"/>
                 </authorization>
             </security-realm>
+            <security-realm name="SSLRealm1">
+                <server-identities>
+                    <ssl>
+                        <keystore path="server-keystore.jks" relative-to="jboss.server.config.dir" keystore-password="secret" alias="main" key-password="secret"/>
+                    </ssl>
+                </server-identities>
+            </security-realm>
         </security-realms>
         <audit-log>
             <formatters>
@@ -323,14 +330,12 @@
         <subsystem xmlns="urn:infinispan:server:endpoint:9.4">
             <hotrod-connector name="hotrod" cache-container="clustered" />
             <rest-connector name="rest" cache-container="clustered" />
-            <!--
             <router-connector name="router-ssl" single-port-socket-binding="rest-ssl">
                 <single-port security-realm="SSLRealm1">
                     <hotrod name="hotrod" />
                     <rest name="rest" />
                 </single-port>
             </router-connector>
-            -->
             <router-connector name="router" single-port-socket-binding="rest">
                 <single-port>
                     <hotrod name="hotrod" />
