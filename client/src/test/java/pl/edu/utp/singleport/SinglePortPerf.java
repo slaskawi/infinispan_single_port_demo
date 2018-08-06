@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import org.apache.commons.lang3.StringUtils;
 import org.infinispan.client.hotrod.RemoteCache;
@@ -29,6 +30,7 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
+import org.openjdk.jmh.runner.options.TimeValue;
 
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
@@ -65,7 +67,7 @@ public class SinglePortPerf {
    @State(Scope.Thread)
    public static class BenchmarkState {
 
-      static final int MEASUREMENT_SIZE = 10;
+      static final int MEASUREMENT_SIZE = 1;
 
       private final String HTTPS_ROUTE = "infinispan-app-https-myproject.127.0.0.1.nip.io";
       private final String HTTP_ROUTE = "infinispan-app-http-myproject.127.0.0.1.nip.io";
@@ -73,11 +75,10 @@ public class SinglePortPerf {
       RemoteCache<String, String> tlsAlpnCache;
       RemoteCache<String, String> httpUpgradeCache;
 
-      RemoteCache<String, String> tlsAlpnDirectCache;
-      RemoteCache<String, String> http;
-
       NettyHttpClient httpUpgradeHttp2Client;
-      private NettyHttpClient tlsAlpnHttp2Client;
+      NettyHttpClient tlsAlpnHttp2Client;
+      //HTTP/1.1 clients in Netty are single shot :((( We need to pool them.
+      List<NettyHttpClient> http11Clients = new ArrayList<>(MEASUREMENT_SIZE);
 
       private List<String> String36ByteList = new ArrayList<>(MEASUREMENT_SIZE);
       private List<String> String360ByteList = new ArrayList<>(MEASUREMENT_SIZE);
@@ -94,6 +95,12 @@ public class SinglePortPerf {
 
          httpUpgradeHttp2Client = NettyHttpClient.newHttp2ClientWithHttp11Upgrade();
          httpUpgradeHttp2Client.start(HTTP_ROUTE, 80);
+
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            NettyHttpClient http11Client = NettyHttpClient.newHttp11Client();
+            http11Client.start(HTTP_ROUTE, 80);
+            http11Clients.add(http11Client);
+         }
 
          tlsAlpnHttp2Client = NettyHttpClient
                .newHttp2ClientWithALPN(TRUSTSTORE_URI.getFile(), TRUSTSTORE_PASSWORD, HTTPS_ROUTE);
@@ -134,6 +141,11 @@ public class SinglePortPerf {
 
          httpUpgradeHttp2Client.stop();
          tlsAlpnHttp2Client.stop();
+
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            http11Clients.get(i).stop();
+         }
+         http11Clients.clear();
       }
 
       @Benchmark
@@ -164,6 +176,15 @@ public class SinglePortPerf {
 
       @Benchmark
       @BenchmarkMode(Mode.SingleShotTime)
+      public void initHTTP11Connection() throws Exception {
+         NettyHttpClient client = NettyHttpClient
+               .newHttp11Client();
+         client.start(HTTP_ROUTE, 80);
+         client.stop();
+      }
+
+      @Benchmark
+      @BenchmarkMode(Mode.SingleShotTime)
       public void initHTTPUpgradeHotRodConnection() throws Exception {
          RemoteCacheManager tlsAlpnRemoteCacheManager = getTlsAlpnRemoteCacheManager();
          tlsAlpnRemoteCacheManager.getCache("default");
@@ -171,17 +192,16 @@ public class SinglePortPerf {
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet36ByteEntriesThroughHotRodAndTLSALPN() throws Exception {
+      public void put36ByteEntriesThroughHotRodAndTLSALPN() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             tlsAlpnCache.put(String36ByteList.get(i), String36ByteList.get(i));
-            tlsAlpnCache.get(String36ByteList.get(i));
          }
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
       public void putAndGet36ByteEntriesThroughHotRodAndHTTPUpgrade() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
@@ -191,93 +211,146 @@ public class SinglePortPerf {
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet36ByteEntriesThroughHTTP2AndHTTPUpgrade() throws Exception {
+      public void put36ByteEntriesThroughHTTP2AndHTTPUpgrade() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String36ByteList.get(i),
                   wrappedBuffer(String36ByteList.get(0).getBytes(CharsetUtil.UTF_8)));
-            FullHttpRequest getValueFromCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, GET, "/rest/default/" + String36ByteList.get(i));
             httpUpgradeHttp2Client.sendRequest(putValueInCacheRequest);
-            httpUpgradeHttp2Client.sendRequest(getValueFromCacheRequest);
-            while(httpUpgradeHttp2Client.getResponses().size() < (i + 1) * 2) {
-               System.out.println("Queue = " + httpUpgradeHttp2Client.getResponses().size());
+            while(httpUpgradeHttp2Client.getResponses().size() < i + 1) {
+               LockSupport.parkNanos(100);
             }
          }
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet36ByteEntriesThroughHTTP2AndTLSALPN() throws Exception {
+      public void put36ByteEntriesThroughHTTP2AndTLSALPN() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String36ByteList.get(i),
                   wrappedBuffer(String36ByteList.get(0).getBytes(CharsetUtil.UTF_8)));
             FullHttpRequest getValueFromCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, GET, "/rest/default/" + String36ByteList.get(i));
             tlsAlpnHttp2Client.sendRequest(putValueInCacheRequest);
-            tlsAlpnHttp2Client.sendRequest(getValueFromCacheRequest);
             //we always wait for the responses before continuing the loop.
-            while(tlsAlpnHttp2Client.getResponses().size() < (i + 1) * 2) {
-               System.out.println("Queue = " + tlsAlpnHttp2Client.getResponses().size());
+            while(tlsAlpnHttp2Client.getResponses().size() < i + 1) {
+               LockSupport.parkNanos(100);
             }
          }
       }
 
+      @Benchmark
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
+      @Measurement(iterations = MEASUREMENT_SIZE)
+      public void put36ByteEntriesThroughHTTP11WithPooling() throws Exception {
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String36ByteList.get(i),
+                  wrappedBuffer(String36ByteList.get(i).getBytes(CharsetUtil.UTF_8)));
+            putValueInCacheRequest.headers().add("HOST", HTTP_ROUTE);
+            http11Clients.get(i).sendRequest(putValueInCacheRequest);
+            while(http11Clients.get(i).getResponses().size() < 1) {
+               LockSupport.parkNanos(100);
+            }
+         }
+      }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet360ByteEntriesThroughHotRodAndTLSALPN() throws Exception {
+      public void put360ByteEntriesThroughHotRodAndTLSALPN() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             tlsAlpnCache.put(String360ByteList.get(i), String36ByteList.get(i));
-            tlsAlpnCache.get(String360ByteList.get(i));
          }
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet360ByteEntriesThroughHotRodAndHTTPUpgrade() throws Exception {
+      public void put360ByteEntriesThroughHotRodAndHTTPUpgrade() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             httpUpgradeCache.put(String360ByteList.get(i), String360ByteList.get(i));
-            httpUpgradeCache.get(String360ByteList.get(i));
          }
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet360ByteEntriesThroughHTTP2AndHTTPUpgrade() throws Exception {
+      public void put360ByteEntriesThroughHTTP2AndHTTPUpgrade() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String360ByteList.get(i),
                   wrappedBuffer(String36ByteList.get(0).getBytes(CharsetUtil.UTF_8)));
-            FullHttpRequest getValueFromCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, GET, "/rest/default/" + String360ByteList.get(i));
             httpUpgradeHttp2Client.sendRequest(putValueInCacheRequest);
-            httpUpgradeHttp2Client.sendRequest(getValueFromCacheRequest);
-            while(httpUpgradeHttp2Client.getResponses().size() < (i + 1) * 2) {
-               System.out.println("Queue = " + httpUpgradeHttp2Client.getResponses().size());
+            while(httpUpgradeHttp2Client.getResponses().size() < i + 1) {
+               LockSupport.parkNanos(100);
             }
          }
       }
 
       @Benchmark
-      @BenchmarkMode(Mode.AverageTime)
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
       @Measurement(iterations = MEASUREMENT_SIZE)
-      public void putAndGet360ByteEntriesThroughHTTP2AndTLSALPN() throws Exception {
+      public void put360ByteEntriesThroughHTTP2AndTLSALPN() throws Exception {
          for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
             FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String360ByteList.get(i),
                   wrappedBuffer(String360ByteList.get(0).getBytes(CharsetUtil.UTF_8)));
-            FullHttpRequest getValueFromCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, GET, "/rest/default/" + String360ByteList.get(i));
             tlsAlpnHttp2Client.sendRequest(putValueInCacheRequest);
-            tlsAlpnHttp2Client.sendRequest(getValueFromCacheRequest);
-            //we always wait for the responses before continuing the loop.
-            while(tlsAlpnHttp2Client.getResponses().size() < (i + 1) * 2) {
-               System.out.println("Queue = " + tlsAlpnHttp2Client.getResponses().size());
+            while(tlsAlpnHttp2Client.getResponses().size() < i + 1) {
+               LockSupport.parkNanos(100);
             }
          }
       }
 
-   }
+      @Benchmark
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
+      @Measurement(iterations = MEASUREMENT_SIZE)
+      public void put360ByteEntriesThroughHTTP11WithPooling() throws Exception {
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String360ByteList.get(i),
+                  wrappedBuffer(String36ByteList.get(i).getBytes(CharsetUtil.UTF_8)));
+            putValueInCacheRequest.headers().add("HOST", HTTP_ROUTE);
+            http11Clients.get(i).sendRequest(putValueInCacheRequest);
+            while(http11Clients.get(i).getResponses().size() < 1) {
+               LockSupport.parkNanos(100);
+            }
+         }
+      }
 
+      @Benchmark
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
+      @Measurement(iterations = MEASUREMENT_SIZE)
+      public void put36ByteEntriesThroughHTTP11WithoutPooling() throws Exception {
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            NettyHttpClient client = NettyHttpClient.newHttp11Client();
+            client.start(HTTP_ROUTE, 80);
+            FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String36ByteList.get(i),
+                  wrappedBuffer(String36ByteList.get(i).getBytes(CharsetUtil.UTF_8)));
+            putValueInCacheRequest.headers().add("HOST", HTTP_ROUTE);
+            client.sendRequest(putValueInCacheRequest);
+            while(client.getResponses().size() < 1) {
+               LockSupport.parkNanos(100);
+            }
+            client.stop();
+         }
+      }
+
+      @Benchmark
+      @BenchmarkMode({Mode.AverageTime, Mode.SingleShotTime})
+      @Measurement(iterations = MEASUREMENT_SIZE)
+      public void put360ByteEntriesThroughHTTP11WithoutPooling() throws Exception {
+         for (int i = 0; i < MEASUREMENT_SIZE; ++i) {
+            NettyHttpClient client = NettyHttpClient.newHttp11Client();
+            client.start(HTTP_ROUTE, 80);
+            FullHttpRequest putValueInCacheRequest = new DefaultFullHttpRequest(HTTP_1_1, PUT, "/rest/default/" + String360ByteList.get(i),
+                  wrappedBuffer(String360ByteList.get(i).getBytes(CharsetUtil.UTF_8)));
+            putValueInCacheRequest.headers().add("HOST", HTTP_ROUTE);
+            client.sendRequest(putValueInCacheRequest);
+            while(client.getResponses().size() < 1) {
+               LockSupport.parkNanos(100);
+            }
+            client.stop();
+         }
+      }
+   }
 
 }
